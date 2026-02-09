@@ -463,13 +463,229 @@ When a cloud/iOS task produces work you want to continue locally:
 
 ---
 
+---
+
+## 10. Can Hooks Auto-Persist Memory on Session Exit? <a name="hook-memory-persistence"></a>
+
+This section investigates whether a hook in your iOS/cloud repo can automatically save auto memory back into the project before the VM is destroyed.
+
+### 10.1 Available Hook Events
+
+Claude Code supports **14 hook events**. The relevant ones for memory persistence:
+
+| Event | When | Can Block? | Hook Types Allowed |
+|---|---|---|---|
+| `Stop` | Each time Claude finishes a response (per-turn) | Yes | command, prompt, agent |
+| `TaskCompleted` | When a task is marked complete | Yes | command, prompt, agent |
+| `SessionEnd` | When the session terminates | **No** | **command only** |
+| `SessionStart` | When a session begins | No | command, prompt, agent |
+
+### 10.2 The User's Key Insight: Scripts vs. LLM Prompts at Exit
+
+This observation is correct and documented. At session exit:
+
+- **`type: "prompt"` hooks** (which make an LLM call for evaluation) are **NOT supported** for `SessionEnd`. The session is tearing down — there's no infrastructure for an LLM round-trip.
+- **`type: "agent"` hooks** (multi-turn LLM with tools) are also **NOT supported** for `SessionEnd`.
+- **`type: "command"` hooks** (shell scripts) **ARE supported** for `SessionEnd`. A script can copy files, run git commands, and make HTTP requests without needing the LLM.
+
+So: **you cannot use Claude to intelligently summarize or curate memory at exit**, but you **can** run a script that mechanically copies memory files and commits them.
+
+### 10.3 SessionEnd Reliability Warning
+
+**SessionEnd hooks have known reliability bugs:**
+
+| Scenario | Does SessionEnd Fire? | Issue |
+|---|---|---|
+| Normal completion | Usually yes | — |
+| `/exit` command | **Often no** | [#17885](https://github.com/anthropics/claude-code/issues/17885) |
+| `/clear` command | **Often no** | [#6428](https://github.com/anthropics/claude-code/issues/6428) |
+| API 500 error / crash | **No** | [#20197](https://github.com/anthropics/claude-code/issues/20197) |
+| Closing terminal/app | **Inconsistent** | Multiple reports |
+
+This means relying **solely** on `SessionEnd` for memory persistence is risky — you may lose memory on crashes or abnormal exits.
+
+### 10.4 Recommended Strategy: Layered Hooks
+
+Use multiple hooks for defense-in-depth:
+
+**Layer 1 — `Stop` hook (most reliable, fires every turn):**
+
+The `Stop` hook fires every time Claude finishes a response. Use it to incrementally snapshot memory after every turn. This is the most reliable layer because it fires frequently and doesn't depend on clean session termination.
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/persist-memory.sh",
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Layer 2 — `SessionEnd` hook (best-effort final save):**
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/final-persist-memory.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Layer 3 — `SessionStart` hook (restore on next session):**
+
+On session start, copy any previously-committed memory snapshot back into `~/.claude/projects/*/memory/` so Claude's auto memory system picks it up.
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/restore-memory.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### 10.5 Example Scripts
+
+#### persist-memory.sh (for Stop and SessionEnd hooks)
+
+```bash
+#!/bin/bash
+# Persist Claude auto memory into the repo so it survives VM destruction.
+# Runs on Stop (every turn) and SessionEnd (final cleanup).
+
+set -euo pipefail
+
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+[ -z "$CWD" ] && exit 0
+
+REPO_ROOT=$(cd "$CWD" && git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+# Locate the auto memory directory.
+# Claude Code uses an encoded form of the repo root as the project key.
+# Try multiple encoding schemes since this is underdocumented.
+MEMORY_DIR=""
+for dir in "$HOME"/.claude/projects/*/memory; do
+  if [ -d "$dir" ] && [ -f "$dir/MEMORY.md" ]; then
+    MEMORY_DIR="$dir"
+    break
+  fi
+done
+
+[ -z "$MEMORY_DIR" ] && exit 0
+
+# Destination inside the repo
+DEST="$REPO_ROOT/.claude/memory-snapshot"
+mkdir -p "$DEST"
+
+# Only copy if memory has changed (avoid empty commits)
+if ! diff -qr "$MEMORY_DIR" "$DEST" >/dev/null 2>&1; then
+  cp -r "$MEMORY_DIR"/* "$DEST/" 2>/dev/null || true
+
+  cd "$REPO_ROOT"
+  git add .claude/memory-snapshot/ 2>/dev/null || true
+
+  # Check if there are staged changes
+  if ! git diff --cached --quiet .claude/memory-snapshot/ 2>/dev/null; then
+    git commit -m "Auto-persist Claude memory snapshot [skip ci]" --no-verify 2>/dev/null || true
+    git push 2>/dev/null || true
+  fi
+fi
+
+exit 0
+```
+
+#### restore-memory.sh (for SessionStart hook)
+
+```bash
+#!/bin/bash
+# Restore previously-persisted memory into Claude's auto memory directory.
+# Runs on SessionStart so cloud sessions inherit memory from prior sessions.
+
+set -euo pipefail
+
+INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+[ -z "$CWD" ] && exit 0
+
+REPO_ROOT=$(cd "$CWD" && git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+SNAPSHOT="$REPO_ROOT/.claude/memory-snapshot"
+[ -d "$SNAPSHOT" ] || exit 0
+
+# Find or create the auto memory directory
+MEMORY_BASE="$HOME/.claude/projects"
+mkdir -p "$MEMORY_BASE"
+
+# Create a project directory using the repo root as key
+PROJECT_KEY=$(echo "$REPO_ROOT" | sed 's|/|%2F|g; s|^%2F||')
+MEMORY_DIR="$MEMORY_BASE/$PROJECT_KEY/memory"
+mkdir -p "$MEMORY_DIR"
+
+# Copy snapshot into memory dir
+cp -r "$SNAPSHOT"/* "$MEMORY_DIR/" 2>/dev/null || true
+
+echo "Restored memory snapshot from .claude/memory-snapshot/" >&2
+exit 0
+```
+
+### 10.6 Caveats and Gotchas
+
+1. **Infinite loop risk with `Stop` hook**: If your hook returns content in `systemMessage` or `decision: "block"`, Claude may interpret it as new instructions and respond again, triggering the `Stop` hook again. Use `async: true` and return no blocking content.
+
+2. **Git push from `Stop` hook**: Pushing on every turn is expensive and slow. Consider only committing locally on `Stop` and pushing only on `SessionEnd`. Or use a timestamp check to push at most every N minutes.
+
+3. **Project hash uncertainty**: The exact encoding Claude Code uses to derive the project directory name under `~/.claude/projects/` is not well-documented. The restore script uses a simple URL-encoding heuristic, but this may not match Claude's internal encoding. Testing is required.
+
+4. **Merge conflicts**: If multiple cloud sessions run concurrently against the same repo, their memory snapshots could conflict. Consider using branch-specific or session-specific snapshot paths.
+
+5. **`.gitignore` considerations**: You may want to `.gitignore` the memory snapshot directory if you don't want it in PRs, or use a dedicated branch for memory persistence.
+
+6. **Cloud-specific behavior**: Set hooks to detect cloud environments via `$CLAUDE_CODE_REMOTE` and adjust behavior (e.g., always push in cloud since the VM is ephemeral, but only commit locally on desktop).
+
+### 10.7 Alternative: Use `CLAUDE.md` as the Memory Transport
+
+A simpler (if less automatic) approach: instead of snapshotting the auto memory directory, have Claude write important learnings directly into the committed `CLAUDE.md` file during the session. This doesn't require hooks at all — Claude naturally reads and writes `CLAUDE.md`. The downside is that `CLAUDE.md` modifications are part of the working tree and will appear in PRs.
+
+---
+
 ## Open Questions for Further Research
 
 1. **Will Anthropic add persistent `~/.claude` volumes for cloud sessions?** The `CLAUDE_HOME` feature request (#19244) suggests demand exists.
-2. **Can `SessionStart` hooks be used to restore auto memory from a committed file?** (e.g., copy a committed `memory-backup.md` to `~/.claude/projects/*/memory/MEMORY.md`)
+2. **Exact project hash encoding**: What encoding does Claude Code use for `~/.claude/projects/<project>/`? This is critical for the restore script to work correctly.
 3. **How does Claude Cowork (desktop VM) handle this differently?** Cowork uses a persistent local VM rather than ephemeral cloud VMs — does it preserve `~/.claude` across sessions?
 4. **Will MCP server support come to cloud environments?** Currently there's no mechanism to connect MCP servers to cloud VMs.
-5. **What is the relationship between Claude app "Projects" (conversation organizer) and Claude Code cloud environments?** Could project-level knowledge from Claude Projects feed into Claude Code sessions?
+5. **Can `TaskCompleted` hook serve as a more reliable alternative to `SessionEnd`?** In cloud/iOS sessions where each session is one task, `TaskCompleted` might fire more reliably.
+6. **What is the relationship between Claude app "Projects" (conversation organizer) and Claude Code cloud environments?** Could project-level knowledge from Claude Projects feed into Claude Code sessions?
 
 ---
 
@@ -478,6 +694,12 @@ When a cloud/iOS task produces work you want to continue locally:
 - [Claude Code on the web — Official Docs](https://code.claude.com/docs/en/claude-code-on-the-web)
 - [Claude Code Settings — Official Docs](https://code.claude.com/docs/en/settings)
 - [Manage Claude's Memory — Official Docs](https://code.claude.com/docs/en/memory)
+- [Claude Code Hooks — Official Docs](https://code.claude.com/docs/en/hooks)
 - [Making Claude Code More Secure and Autonomous — Anthropic Engineering](https://www.anthropic.com/engineering/claude-code-sandboxing)
 - [Feature Request: CLAUDE_HOME — GitHub Issue #19244](https://github.com/anthropics/claude-code/issues/19244)
+- [SessionEnd does not fire on /exit — GitHub Issue #17885](https://github.com/anthropics/claude-code/issues/17885)
+- [SessionEnd does not fire on /clear — GitHub Issue #6428](https://github.com/anthropics/claude-code/issues/6428)
+- [SessionEnd does not fire on API 500 — GitHub Issue #20197](https://github.com/anthropics/claude-code/issues/20197)
 - [Using the GitHub Integration — Claude Help Center](https://support.claude.com/en/articles/10167454-using-the-github-integration)
+- [claude-mem — Stop and SessionEnd hooks for memory](https://github.com/thedotmack/claude-mem)
+- [everything-claude-code — Hooks examples](https://github.com/affaan-m/everything-claude-code)
